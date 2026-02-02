@@ -1,20 +1,18 @@
 import streamlit as st
-import pypdf
-import re
+import requests
 import random
-import os
-import pandas as pd
-from collections import Counter
 import time
+from collections import Counter
+from datetime import datetime
 
 # --- KONFIGURACJA KENO ---
 st.set_page_config(
-    page_title="Keno Smart System",
+    page_title="Keno Smart System LIVE",
     page_icon="⚡",
     layout="centered"
 )
 
-# --- STYL (ZIELONY - SZYBKI) ---
+# --- STYL ---
 st.markdown("""
     <style>
     .stApp { background-color: #0d1f12; color: #e8f5e9; }
@@ -33,62 +31,60 @@ st.markdown("""
         color: #a5d6a7; margin-bottom: 10px;
     }
     h1 { color: #66bb6a !important; }
+    .status-live {
+        color: #00ff00; font-weight: bold; font-size: 14px;
+        border: 1px solid #00ff00; padding: 5px 10px; border-radius: 15px;
+        display: inline-block; margin-bottom: 10px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-# --- FUNKCJE DANYCH ---
-@st.cache_data
-def load_data(file_path):
-    if not os.path.exists(file_path):
-        return []
-    draws = []
+# --- FUNKCJA POBIERANIA DANYCH (OFICJALNE API LOTTO) ---
+@st.cache_data(ttl=180) # Odświeżaj co 3 minuty
+def get_live_draws():
+    # Oficjalny endpoint Lotto.pl zwracający 1000 ostatnich wyników Keno w formacie JSON
+    url = "https://www.lotto.pl/api/lotteries/draw-results/by-gametype?game=Keno&index=1&size=1000&sort=drawSystemId&order=DESC"
+    
     try:
-        reader = pypdf.PdfReader(file_path)
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            tokens = re.findall(r'\d+', text)
-            i = 0
-            while i < len(tokens):
-                candidates = []
-                offset = 0
-                # Keno: losuje się 20 liczb z 70
-                while len(candidates) < 20 and (i + offset) < len(tokens):
-                    try:
-                        val = int(tokens[i+offset])
-                        # Ignorujemy duże numery ID losowania (np. 1448950)
-                        if 1 <= val <= 70:
-                            candidates.append(val)
-                        else:
-                            # Jeśli trafimy na ID losowania w środku, przerywamy zbieranie
-                            if candidates: break 
-                    except: break
-                    offset += 1
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        
+        parsed_draws = []
+        # Lotto API zwraca listę w polu 'items'
+        for item in data.get('items', []):
+            try:
+                # Wyciągamy liczby z każdego losowania
+                results = item.get('results', [])
+                if results:
+                    # Liczby są w 'resultsJson' jako lista
+                    nums = results[0].get('resultsJson', [])
+                    # Upewniamy się, że to liczby całkowite
+                    nums = [int(n) for n in nums]
+                    parsed_draws.append(nums)
+            except:
+                continue
                 
-                # Jeśli znaleźliśmy chociaż 15 liczb w ciągu, uznajemy to za losowanie
-                # (czasem PDF dzieli wiersze)
-                if len(candidates) >= 15:
-                    draws.append(candidates)
-                    i += offset
-                else:
-                    i += 1
-    except:
+        # API zwraca od najnowszego, więc dla pewności bierzemy po prostu te dane
+        # Nasz algorytm potrzebuje listy list.
+        return parsed_draws
+        
+    except Exception as e:
+        # W razie awarii API zwróć pustą listę
         return []
-    return draws
 
 def get_hot_weights(draws):
     flat = [n for d in draws for n in d]
     c = Counter(flat)
-    # Wagi dla liczb 1-70
     return [c.get(i, 1) for i in range(1, 71)]
 
-# --- GENERATOR KENO SMART ---
-def generate_keno_real(weights, num_picks=10):
+# --- ALGORYTM GENERUJĄCY ---
+def generate_keno_live(weights, num_picks=10):
     population = list(range(1, 71))
     
-    # Próbujemy max 5000 razy znaleźć idealny układ
     for _ in range(5000):
-        # 1. Losowanie ważone (Hot Numbers z pliku!)
-        stronger_weights = [w**1.3 for w in weights] # Lekkie wzmocnienie trendu
+        # 1. Losowanie ważone (Hot Numbers z LIVE danych!)
+        stronger_weights = [w**1.3 for w in weights]
         
         candidates = set()
         while len(candidates) < num_picks:
@@ -97,32 +93,23 @@ def generate_keno_real(weights, num_picks=10):
         
         nums = sorted(list(candidates))
         
-        # --- FILTRY KENO ---
-        
-        # 1. Strefy (Dzielimy 70 liczb na 3 części: 1-23, 24-46, 47-70)
-        # Dobry kupon Keno powinien być rozstrzelony po planszy.
+        # --- FILTRY ---
         if num_picks >= 5:
             z1 = sum(1 for n in nums if n <= 23)
             z2 = sum(1 for n in nums if 23 < n <= 46)
             z3 = sum(1 for n in nums if n > 46)
-            
-            # Wymagamy obecności w każdej strefie przy grze na 10
-            if num_picks == 10 and (z1 == 0 or z2 == 0 or z3 == 0):
-                continue
+            if num_picks == 10 and (z1 == 0 or z2 == 0 or z3 == 0): continue
         
-        # 2. Parzystość (4-6 parzystych przy 10 liczbach)
         even = sum(1 for n in nums if n % 2 == 0)
         if num_picks == 10 and (even < 4 or even > 6): continue
         if num_picks == 5 and (even < 2 or even > 3): continue
             
-        # 3. Ciągi (Brak schodków > 2)
         consecutive = 0
         max_cons = 0
         for i in range(len(nums)-1):
             if nums[i+1] == nums[i] + 1: consecutive += 1
             else: consecutive = 0
             max_cons = max(max_cons, consecutive)
-            
         if max_cons >= 2: continue
             
         return nums, even
@@ -132,53 +119,49 @@ def generate_keno_real(weights, num_picks=10):
 # --- INTERFEJS ---
 def main():
     st.title("⚡ Keno Smart System")
-    st.markdown("Analiza historyczna bazy PDF + Filtry strefowe.")
     
-    FILE_NAME = "999los.pdf"
-    draws = load_data(FILE_NAME)
+    # Pobieranie danych na żywo
+    with st.spinner("Łączenie z serwerem Lotto.pl..."):
+        draws = get_live_draws()
     
     if not draws:
-        st.warning(f"⚠️ Nie widzę pliku {FILE_NAME}. Wgraj go, aby użyć historii.")
+        st.error("⚠️ Błąd połączenia z serwerem Lotto. Spróbuj odświeżyć stronę.")
         weights = [1] * 70
-        db_info = "Tryb losowy (Brak danych)"
+        status_text = "OFFLINE"
     else:
         weights = get_hot_weights(draws)
-        db_info = f"Baza: {len(draws)} ostatnich losowań"
+        # Bierzemy timestamp ostatniego losowania dla potwierdzenia
+        status_text = f"🟢 ONLINE: Baza {len(draws)} losowań (Lotto.pl)"
 
-    st.info(f"📊 {db_info}")
+    st.markdown(f"<div class='status-live'>{status_text}</div>", unsafe_allow_html=True)
+    st.markdown("Algorytm pobiera wyniki bezpośrednio z oficjalnego serwera Lotto.")
 
     # Wybór trybu
-    st.write("Wybierz strategię:")
     c1, c2 = st.columns(2)
     with c1:
-        mode_10 = st.button("Gra na 10 liczb (Agresywna)", use_container_width=True)
+        mode_10 = st.button("Gra na 10 liczb", use_container_width=True)
     with c2:
-        mode_5 = st.button("Gra na 5 liczb (Ostrożna)", use_container_width=True)
+        mode_5 = st.button("Gra na 5 liczb", use_container_width=True)
 
-    # Logika
-    if 'k_res' not in st.session_state:
-        st.session_state['k_res'] = None
+    if 'live_res' not in st.session_state:
+        st.session_state['live_res'] = None
         
     if mode_10:
-        with st.spinner("Analiza trendów z pliku PDF..."):
-            time.sleep(0.3)
-            res, ev = generate_keno_real(weights, 10)
-            st.session_state['k_res'] = (res, ev, 10)
+        with st.spinner("Analiza danych..."):
+            res, ev = generate_keno_live(weights, 10)
+            st.session_state['live_res'] = (res, ev, 10)
             
     if mode_5:
-        with st.spinner("Szukanie pewniaków..."):
-            time.sleep(0.3)
-            res, ev = generate_keno_real(weights, 5)
-            st.session_state['k_res'] = (res, ev, 5)
+        with st.spinner("Analiza danych..."):
+            res, ev = generate_keno_live(weights, 5)
+            st.session_state['live_res'] = (res, ev, 5)
 
-    # Wynik
-    if st.session_state['k_res']:
-        res, ev, picks = st.session_state['k_res']
+    if st.session_state['live_res']:
+        res, ev, picks = st.session_state['live_res']
         
         st.divider()
-        st.subheader(f"Twoje liczby ({picks} z 70):")
+        st.subheader(f"Typ na {picks} liczb:")
         
-        # Kule
         html = "<div style='display: flex; flex-wrap: wrap; justify-content: center;'>"
         for n in res:
             html += f"<div class='keno-ball'>{n}</div>"
@@ -187,12 +170,10 @@ def main():
         
         st.markdown("<br>", unsafe_allow_html=True)
         
-        # Statystyki
         m1, m2 = st.columns(2)
         m1.markdown(f"<div class='metric-box'>⚖️ Parzyste: <b>{ev}/{picks}</b></div>", unsafe_allow_html=True)
-        m2.markdown(f"<div class='metric-box'>🔥 Źródło<br><small>Hot Numbers (PDF)</small></div>", unsafe_allow_html=True)
-        
-        st.caption("Algorytm wybrał liczby najczęściej występujące w Twoim pliku, a następnie odrzucił te, które tworzyłyby skupiska lub ciągi.")
+        m2.markdown(f"<div class='metric-box'>🔥 Źródło<br><small>Oficjalne API Lotto</small></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
+    
